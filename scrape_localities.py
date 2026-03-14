@@ -190,8 +190,146 @@ def exif_set_user_comment_jpeg(jpeg_path: Path, comment: str) -> None:
     # Also set ImageDescription for better compatibility.
     exif.setdefault("0th", {})
     exif["0th"][piexif.ImageIFD.ImageDescription] = comment.encode("utf-8", "ignore")
+    # Windows Explorer tends to surface XPComment/XPSubject rather than ImageDescription.
+    # These are UTF-16LE null-terminated byte strings.
+    try:
+        xp = (comment + "\x00").encode("utf-16le", "ignore")
+        exif["0th"][piexif.ImageIFD.XPComment] = xp
+        exif["0th"][piexif.ImageIFD.XPSubject] = xp
+    except Exception:
+        pass
     exif_bytes = piexif.dump(exif)
     piexif.insert(exif_bytes, str(jpeg_path))
+
+
+def _xml_escape(text: str) -> str:
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&apos;")
+    )
+
+
+def jpeg_set_xmp_description(jpeg_path: Path, description: str) -> None:
+    """Write caption as XMP dc:description (APP1).
+
+    Many viewers surface XMP/"Description" as image metadata more reliably than EXIF UserComment.
+    """
+    if not description:
+        return
+    data = jpeg_path.read_bytes()
+    if not (len(data) >= 2 and data[0] == 0xFF and data[1] == 0xD8):
+        return
+
+    xmp_header = b"http://ns.adobe.com/xap/1.0/\x00"
+    desc_xml = _xml_escape(description)
+    xmp_xml = (
+        "<?xpacket begin='\ufeff' id='W5M0MpCehiHzreSzNTczkc9d'?>"
+        "<x:xmpmeta xmlns:x='adobe:ns:meta/'>"
+        "<rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>"
+        "<rdf:Description xmlns:dc='http://purl.org/dc/elements/1.1/'>"
+        "<dc:description><rdf:Alt>"
+        f"<rdf:li xml:lang='x-default'>{desc_xml}</rdf:li>"
+        "</rdf:Alt></dc:description>"
+        "</rdf:Description>"
+        "</rdf:RDF>"
+        "</x:xmpmeta>"
+        "<?xpacket end='w'?>"
+    ).encode("utf-8")
+    payload = xmp_header + xmp_xml
+    if len(payload) + 2 > 0xFFFF:
+        # JPEG segment length is 16-bit including the length bytes.
+        payload = payload[: 0xFFFF - 2]
+
+    def build_segment(marker: int, seg_data: bytes) -> bytes:
+        length = len(seg_data) + 2
+        return bytes([0xFF, marker]) + length.to_bytes(2, "big") + seg_data
+
+    # Parse segments up to SOS, strip existing XMP APP1 segments.
+    segments: list[tuple[int, bytes, bytes]] = []  # (marker, seg_data, raw_segment_bytes)
+    i = 2
+    remainder: Optional[bytes] = None
+    while i + 4 <= len(data):
+        if data[i] != 0xFF:
+            break
+        # Skip fill bytes.
+        while i < len(data) and data[i] == 0xFF:
+            i += 1
+        if i >= len(data):
+            break
+        marker = data[i]
+        i += 1
+        if marker in (0xD9,):
+            break
+        if marker in (0xDA,):
+            # Start of scan: remainder is compressed data until EOI.
+            sos_start = i - 2
+            remainder = data[sos_start:]
+            break
+        if i + 2 > len(data):
+            break
+        seg_len = int.from_bytes(data[i : i + 2], "big")
+        i += 2
+        if seg_len < 2 or i + (seg_len - 2) > len(data):
+            break
+        seg_data = data[i : i + (seg_len - 2)]
+        raw = bytes([0xFF, marker]) + seg_len.to_bytes(2, "big") + seg_data
+        i += seg_len - 2
+
+        # Drop existing XMP.
+        if marker == 0xE1 and seg_data.startswith(xmp_header):
+            continue
+        segments.append((marker, seg_data, raw))
+    if remainder is None:
+        # Unexpected JPEG layout; avoid corrupting the file.
+        return
+
+    new_xmp_seg = build_segment(0xE1, payload)
+
+    # Insert after JFIF (APP0) and EXIF (APP1 Exif\0\0) if present.
+    insert_at = 0
+    for idx, (marker, seg_data, _raw) in enumerate(segments):
+        if marker == 0xE0:
+            insert_at = idx + 1
+            continue
+        if marker == 0xE1 and seg_data.startswith(b"Exif\x00\x00"):
+            insert_at = idx + 1
+            continue
+        break
+
+    rebuilt = bytearray()
+    rebuilt += b"\xFF\xD8"
+    for idx, (_m, _d, raw) in enumerate(segments):
+        if idx == insert_at:
+            rebuilt += new_xmp_seg
+        rebuilt += raw
+    if insert_at >= len(segments):
+        rebuilt += new_xmp_seg
+    rebuilt += remainder
+    jpeg_path.write_bytes(bytes(rebuilt))
+
+
+def set_jpeg_caption_metadata(jpeg_path: Path, caption: str) -> None:
+    """Write caption into common metadata fields.
+
+    - EXIF: UserComment, ImageDescription, XPComment/XPSubject
+    - XMP: dc:description (what many apps show as "Description")
+    """
+    if not caption:
+        return
+    exif_set_user_comment_jpeg(jpeg_path, caption)
+    try:
+        normalize_utf8_jpeg_text(jpeg_path)
+        rewrite_jpeg_with_exif_utf8(jpeg_path)
+    except Exception:
+        pass
+    try:
+        # Insert XMP after Pillow rewrite (Pillow would otherwise drop unknown APP segments).
+        jpeg_set_xmp_description(jpeg_path, caption)
+    except Exception:
+        pass
 
 
 def rewrite_jpeg_with_exif_utf8(jpeg_path: Path) -> None:
@@ -424,29 +562,38 @@ def scrape_one(session: requests.Session, locality_id: int, outdir: Path, delay_
     map_path = page_dir / "locality-map.png"
     images_dir = page_dir / "images"
 
+    update_meta_only = bool(getattr(scrape_one, "update_image_metadata", False))
+
     # Allow re-runs without clobbering by default.
-    if content_path.exists() and not getattr(scrape_one, "overwrite", False):
+    if content_path.exists() and not getattr(scrape_one, "overwrite", False) and not update_meta_only:
         return None
 
     ensure_dir(page_dir)
     ensure_dir(images_dir)
-    content_path.write_text(content_md, encoding="utf-8")
-    time.sleep(delay_s)
+    if not update_meta_only:
+        content_path.write_text(content_md, encoding="utf-8")
+        time.sleep(delay_s)
 
-    bbox = fetch_map_bbox(session, locality_id, preferred_layer)
-    if bbox:
-        try:
-            download_map_png(session, locality_id, bbox, map_path)
-        except Exception as e:
-            print(f"WARN map {locality_id}: {e}", file=sys.stderr)
-    else:
-        print(f"WARN map {locality_id}: no geometry", file=sys.stderr)
-    time.sleep(delay_s)
+        bbox = fetch_map_bbox(session, locality_id, preferred_layer)
+        if bbox:
+            try:
+                download_map_png(session, locality_id, bbox, map_path)
+            except Exception as e:
+                print(f"WARN map {locality_id}: {e}", file=sys.stderr)
+        else:
+            print(f"WARN map {locality_id}: no geometry", file=sys.stderr)
+        time.sleep(delay_s)
 
     # Download photoarchive images
     for pref in photos:
         photo_id = parse_photo_id(pref.photo_page_url)
         if not photo_id:
+            continue
+        existing = sorted(images_dir.glob(f"{photo_id}-*"))
+        if existing and not getattr(scrape_one, "overwrite", False):
+            for p in existing:
+                if p.suffix.lower() in {".jpg", ".jpeg"}:
+                    set_jpeg_caption_metadata(p, pref.caption)
             continue
         # Fotoarchiv does not expose original filenames via headers; keep a stable local name.
         try:
@@ -458,6 +605,8 @@ def scrape_one(session: requests.Session, locality_id: int, outdir: Path, delay_
                 dest = images_dir / f"{photo_id}-{url_basename}"
 
                 if dest.exists() and not getattr(scrape_one, "overwrite", False):
+                    if dest.suffix.lower() in {".jpg", ".jpeg"}:
+                        set_jpeg_caption_metadata(dest, pref.caption)
                     break
                 if dest.exists():
                     dest.unlink(missing_ok=True)
@@ -479,12 +628,7 @@ def scrape_one(session: requests.Session, locality_id: int, outdir: Path, delay_
                     dest = new_dest
 
                 if dest.suffix.lower() in {".jpg", ".jpeg"}:
-                    exif_set_user_comment_jpeg(dest, pref.caption)
-                    try:
-                        normalize_utf8_jpeg_text(dest)
-                        rewrite_jpeg_with_exif_utf8(dest)
-                    except Exception:
-                        pass
+                    set_jpeg_caption_metadata(dest, pref.caption)
                 break
         except Exception as e:
             print(f"WARN photo {locality_id} {photo_id}: {e}", file=sys.stderr)
@@ -508,9 +652,15 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--delay", type=float, default=0.2, help="Sleep between requests (seconds)")
     ap.add_argument("--timeout-seconds", type=int, default=0, help="Stop after N seconds (0 = no limit)")
     ap.add_argument("--overwrite", action="store_true", help="Re-scrape even if content.md exists")
+    ap.add_argument(
+        "--update-image-metadata",
+        action="store_true",
+        help="Update photo captions in image metadata without rewriting content/map",
+    )
     args = ap.parse_args(argv)
 
     setattr(scrape_one, "overwrite", bool(args.overwrite))
+    setattr(scrape_one, "update_image_metadata", bool(args.update_image_metadata))
 
     ensure_dir(args.outdir)
     t0 = time.time()
