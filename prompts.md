@@ -24,3 +24,8 @@ Create the python script for scraping the pages, save it into the project direct
 ## 2. Fixing images metadata
 
 One thing is still missing. I havee prompted you to store the image descriptions into "exif", but I am not sure, if it is the same as "image metadata". I want to store it as image metadata description, which is still mising in the result images.
+
+
+## 3. README.md
+
+Perfect, now create a README.md with instructions for installation and running.
