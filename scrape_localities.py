@@ -31,6 +31,7 @@ import concurrent.futures
 import json
 import os
 import re
+import socket
 import sys
 import time
 import unicodedata
@@ -657,28 +658,85 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help="Update photo captions in image metadata without rewriting content/map",
     )
+    ap.add_argument(
+        "--proxy",
+        type=str,
+        default=None,
+        help="Proxy URL (e.g., socks5://localhost:9050 for Tor)",
+    )
+    ap.add_argument(
+        "--tor-refresh-interval",
+        type=int,
+        default=0,
+        help="Tor circuit refresh interval in seconds (0 = disabled). Minimum 10 seconds.",
+    )
+    ap.add_argument(
+        "--tor-control-password",
+        type=str,
+        default=None,
+        help="Tor control port password (if set)",
+    )
     args = ap.parse_args(argv)
 
     setattr(scrape_one, "overwrite", bool(args.overwrite))
     setattr(scrape_one, "update_image_metadata", bool(args.update_image_metadata))
 
+    proxy_url = args.proxy
+    tor_refresh_interval = args.tor_refresh_interval
+    if tor_refresh_interval and tor_refresh_interval < 10:
+        print("tor-refresh-interval must be at least 10 seconds (Tor restriction)", file=sys.stderr)
+        return 1
+
+    tor_control_password = args.tor_control_password
+    tor_socket: Optional[socket.socket] = None
+    if tor_refresh_interval > 0:
+        try:
+            tor_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            tor_socket.connect(("localhost", 9051))
+            if tor_control_password:
+                tor_socket.sendall(f'AUTHENTICATE "{tor_control_password}"\r\n'.encode())
+                resp = tor_socket.recv(1024)
+                if not resp.startswith(b"250"):
+                    raise RuntimeError(f"Tor auth failed: {resp}")
+        except Exception as e:
+            print(f"WARN: Could not connect to Tor control port: {e}", file=sys.stderr)
+            tor_socket = None
+
+    def refresh_tor_circuit() -> None:
+        if tor_socket:
+            try:
+                tor_socket.sendall(b"SIGNAL NEWNYM\r\n")
+                tor_socket.recv(1024)
+            except Exception:
+                pass
+
+    last_tor_refresh = time.time()
+
     ensure_dir(args.outdir)
     t0 = time.time()
 
-    # One session per worker (requests sessions are not reliably thread-safe).
+    proxies: Optional[dict] = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+
     def worker(locality_id: int) -> Optional[str]:
+        nonlocal last_tor_refresh
         if args.timeout_seconds and (time.time() - t0) > args.timeout_seconds:
             return None
-        with requests.Session() as session:
-            try:
-                return scrape_one(session, locality_id, args.outdir, args.delay)
-            except requests.HTTPError as e:
-                # 404 etc.
-                print(f"WARN page {locality_id}: {e}", file=sys.stderr)
-                return None
-            except Exception as e:
-                print(f"WARN page {locality_id}: {e}", file=sys.stderr)
-                return None
+
+        if tor_refresh_interval > 0 and (time.time() - last_tor_refresh) >= tor_refresh_interval:
+            refresh_tor_circuit()
+            last_tor_refresh = time.time()
+
+        session = requests.Session()
+        if proxies:
+            session.proxies.update(proxies)
+        try:
+            return scrape_one(session, locality_id, args.outdir, args.delay)
+        except requests.HTTPError as e:
+            print(f"WARN page {locality_id}: {e}", file=sys.stderr)
+            return None
+        except Exception as e:
+            print(f"WARN page {locality_id}: {e}", file=sys.stderr)
+            return None
 
     ids = list(iter_ids(args.start, args.end))
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
@@ -688,6 +746,12 @@ def main(argv: list[str]) -> int:
             if page_name:
                 # Continuously print the actually downloaded page_name
                 print(page_name, flush=True)
+
+    if tor_socket:
+        try:
+            tor_socket.close()
+        except Exception:
+            pass
 
     return 0
 

@@ -77,3 +77,23 @@ localities/
 
 - Some IDs do not exist; these are skipped.
 - Fotoarchiv images are downloaded from public endpoints; some variants may return 403/404, in which case the scraper falls back to smaller preview sizes.
+
+## Proxy / Tor Support
+
+Route traffic through a SOCKS5 proxy (e.g., Tor):
+
+```bash
+./.venv/bin/python scrape_localities.py --start 1 --end 3968 --proxy socks5://localhost:9050
+```
+
+To periodically rotate the Tor exit node:
+
+```bash
+./.venv/bin/python scrape_localities.py --start 1 --end 3968 \
+  --proxy socks5://localhost:9050 \
+  --tor-refresh-interval 10 \
+  --tor-control-password "your_password"
+```
+
+- `--tor-refresh-interval`: minimum 10 seconds (Tor restriction)
+- `--tor-control-password`: only needed if your Tor config requires authentication (default port 9051)

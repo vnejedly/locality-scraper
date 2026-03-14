@@ -29,3 +29,7 @@ One thing is still missing. I havee prompted you to store the image descriptions
 ## 3. README.md
 
 Perfect, now create a README.md with instructions for installation and running.
+
+## 4. TOR proxying
+
+Now modify the script in order to pass all the web requests through TOR network so that the source IP address changed periodically in the lowest interval TOR allows.
