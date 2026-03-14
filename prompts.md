@@ -1,3 +1,5 @@
+## 1. Initial prompt
+
 Here is the URL pattern for numbered pages about geological localities(`page_number`=1..3968):
 
 `https://lokality.geology.cz/<number>`
@@ -17,3 +19,8 @@ Every page also contains a frame with map view. This map view must be saved as a
 Each page can contain also a set of images in the right column of the page just under the title "Fotoarchiv". Each of those images must be downloaded and saved into a fsubfolder called `images` under its original filename. As each of the images has a short textual description under it, store this description into the exif data of the image.
 
 Create the python script for scraping the pages, save it into the project directory and run it finally. The script should also continuously write out the actually downloaded `page_name`.
+
+
+## 2. Fixing images metadata
+
+One thing is still missing. I havee prompted you to store the image descriptions into "exif", but I am not sure, if it is the same as "image metadata". I want to store it as image metadata description, which is still mising in the result images.
